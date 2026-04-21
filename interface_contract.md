@@ -1,10 +1,11 @@
-# Interface Contract (Draft) - Remote CSR Proxy
+# Interface Contract (Draft) - Remote CSR Proxy v1
 
 > Status: draft technical specification.
 >
-> Authority: `decision_log.md` remains binding. This contract refines interface
-> behavior without changing the recorded decisions. Any item marked
-> **Open policy** must remain tracked in `open_questions.md` until promoted to a
+> Authority: `decision_log.md` remains binding. This document describes a
+> resource-optimized v1 proposal without changing the decision log. The
+> selectable direct-read behavior is a proposed refinement to the shadow-read
+> baseline and remains tracked in `open_questions.md` until promoted to a
 > decision-log entry.
 
 ---
@@ -12,464 +13,408 @@
 ## 1. Purpose and Scope
 
 The Remote CSR Proxy presents a local AXI/MMIO-visible CSR aperture to the
-PolarFire SoC MSS while synchronizing selected register state with CSR endpoints
+PolarFire SoC MSS while synchronizing 32-bit CSR values with register endpoints
 located in a remote Kintex FPGA.
 
-This contract specifies register-space virtualization behavior only. It does not
-define a generic remote AXI slave emulator, a streaming data path, or a faithful
-transport of arbitrary AXI side effects.
+This v1 contract optimizes PF Fabric resources. It is still a CSR/register-space
+virtualization fabric, not a generic remote AXI slave emulator.
 
-The normative baseline is:
+The binding baseline from `decision_log.md` remains:
 
 | Topic | Current rule |
 | --- | --- |
 | Architecture | PF Fabric implements a policy-driven Remote CSR Proxy. |
-| Read source | MSS reads are served from the local Shadow CSR Bank/proxy state. |
+| Read source | Normal MSS reads are served from the local Shadow CSR Bank/proxy state. |
 | Update payload | Kintex-to-PF register updates carry address and new value. |
 | Ownership | Ownership is per register, not per bit field. |
 | Resync timing | Full/block resync is allowed only at boot, recovery, or idle. |
 | Commands | Pulse-like command registers use WO / doorbell-like semantics. |
 | Policy | Descriptor Table controls behavior and should be MSS-configurable where practical. |
 
+The v1 proposal adds a descriptor-controlled exception to normal shadow reads:
+MSS may mark selected registers as `DIRECT_REMOTE` read registers. A direct read
+blocks the AXI read response until a commLVDS remote read response or timeout is
+observed. This is intentionally limited to reads; v1 has no direct remote write
+mode.
+
 ---
 
-## 2. Logical Interfaces
+## 2. Resource-Optimized v1 Shape
 
-### 2.1 MSS to PF Fabric: Local AXI CSR Interface
+### 2.1 Fixed Capacity and Data Width
+
+| Parameter | v1 value |
+| --- | --- |
+| Register count | 256 CSRs |
+| Register width | 32 bits |
+| CSR stride | 4 bytes |
+| Address mapping | Dense index-based map: `csr_addr = csr_base + index * 4` |
+| Outstanding direct reads | 1 |
+| Notification FIFO depth | 8 entries |
+
+### 2.2 PF Fabric Blocks
+
+| Block | v1 resource intent |
+| --- | --- |
+| AXI CSR decode | One shared decode path for control/status, descriptor bitmaps, and shadow aperture. |
+| Shadow CSR Bank | RAM-based 256 x 32-bit storage; BRAM preferred if mapping is clean, LUTRAM acceptable. |
+| Descriptor Table | Two 256-bit bitmaps: `read_source_bitmap` and `notify_on_change_bitmap`. |
+| commLVDS TX request path | Shared path for shadow writes and direct read requests. |
+| Direct read engine | Single FSM with one timeout counter and one outstanding transaction slot. |
+| Notification path | 8-entry FIFO drained into the Shadow CSR Bank. |
+| Global status | Small flop-based control/status registers for sticky errors, busy flags, interrupt state, and counters. |
+
+The design should avoid per-register FSMs and avoid a flop bank for the full
+shadow image.
+
+---
+
+## 3. Logical Interfaces
+
+### 3.1 MSS to PF Fabric: Local AXI CSR Interface
 
 The MSS accesses the Remote CSR Proxy through a local AXI slave interface.
 
-The AXI-visible address map is divided into at least these logical windows:
+The AXI-visible address map contains:
 
 | Window | Purpose |
 | --- | --- |
-| Proxy control/status | Global enable, reset, interrupt control, link status, stale/error summary, resync trigger/status. |
-| Descriptor programming | MSS-programmed Descriptor Table load/readback interface. |
-| Event/status | Event queue/status, last update address/value, sticky error reporting, optional per-group counters. |
-| Shadow CSR aperture | Local proxy image of remote CSR blocks. |
+| Proxy control/status | Enable, reset, interrupt control, link status, timeout/error state, FIFO overflow, direct-read busy. |
+| Descriptor bitmap programming | MSS writes/reads `read_source_bitmap` and `notify_on_change_bitmap`. |
+| Event/status | Pending notification status, last notification address/value, sticky error indicators. |
+| Shadow CSR aperture | 256 x 32-bit local CSR image. |
 
-AXI reads and writes are terminated by PF Fabric. Normal MSS reads of proxied
-CSRs do not become remote read transactions during active operation.
+Descriptor bitmap updates are allowed only during boot, recovery, or explicit
+idle/quiesced operation. They are not active-traffic operations.
 
-**Open policy:** exact AXI `BRESP`/`RRESP` behavior for rejected accesses,
-stale reads, strict remote completion, and unsupported register classes remains
-open under OQ-001, OQ-002, and OQ-004.
+### 3.2 PF Fabric to Kintex: commLVDS Logical Interface
 
-### 2.2 PF Fabric to Kintex: Remote Control Link
+commLVDS is assumed to be an independent two-FPGA transport that can transfer:
 
-The PF-to-Kintex link carries logical CSR synchronization traffic:
+| commLVDS field | Meaning |
+| --- | --- |
+| `message_id` | Logical message type. |
+| `payload_length` | Payload size in bytes or protocol-defined length units. |
+| `payload` | Message-specific data. |
 
-| Message class | Direction | Minimum payload |
-| --- | --- | --- |
-| Write/update request | PF to Kintex | target address, write value, byte enables or width, descriptor/context id if used |
-| Doorbell request | PF to Kintex | target address, command value, command flags if used |
-| Register update event | Kintex to PF | target address, new value |
-| Write acknowledgment | Kintex to PF | request id or ordered acknowledgment, status/error code |
-| Resync request | PF to Kintex | resync group/range id |
-| Resync data | Kintex to PF | target address, value, group/range id, end marker |
-| Link/error report | either | error code, affected group/address where known |
+The Remote CSR Proxy does not define LVDS physical framing. It defines only the
+logical CSR messages carried over commLVDS.
 
-**Open policy:** packet format, retries, batching, sequence numbering,
-capability negotiation, and exact acknowledgment semantics remain open under
-OQ-005 and OQ-009.
+### 3.3 PF Fabric to MSS: Interrupt and Status
 
-### 2.3 PF Fabric to MSS: Interrupt and Status Interface
-
-PF Fabric reports conditions that software cannot infer safely from shadow reads:
+PF Fabric reports conditions that software cannot infer safely from normal CSR
+reads:
 
 | Condition | Minimum software visibility |
 | --- | --- |
-| Kintex-originated update | event pending interrupt/status, updated shadow value visible before interrupt assertion |
-| Remote write failure | sticky error/status, affected address or group where available |
-| Link fault | interrupt/status, stale/resync-required indication for affected groups |
-| Event overrun/lost sequence | sticky error/status, resync-required indication |
-| Resync completion/failure | status and optional interrupt |
-
-The status interface must make shadow validity observable at least per register
-group. Per-register visibility is allowed but not required by the current
-decision log.
+| Direct-read timeout or error | AXI error response, sticky timeout/error status, optional interrupt. |
+| commLVDS link fault | Sticky link/error status, optional interrupt. |
+| Remote write failure report | Asynchronous sticky error/status, optional interrupt. |
+| Notification received | Shadow update, optional interrupt if enabled by `notify_on_change_bitmap`. |
+| Notification FIFO overflow | Sticky overflow/error status and shadow-suspect indication. |
 
 ---
 
-## 3. Descriptor Table
+## 4. commLVDS CSR Message Semantics
 
-The Descriptor Table is the policy metadata used by the Remote CSR Proxy before
-accepting or applying an MSS access, Kintex event, or resync update.
+All v1 CSR values are 32-bit. Address fields identify the remote CSR address or
+the equivalent dense CSR address derived from the local index.
 
-### 3.1 Descriptor Granularity
+| Message | Direction | Payload | Required behavior |
+| --- | --- | --- | --- |
+| `CSR_WRITE` | PF to Kintex | `{addr, value32}` | Produced after an accepted AXI shadow write. Does not hold AXI `BRESP` for Kintex apply. |
+| `CSR_READ_REQ` | PF to Kintex | `{addr}` | Produced for a `DIRECT_REMOTE` AXI read when the direct-read engine is free. |
+| `CSR_READ_RESP` | Kintex to PF | `{addr, status, value32}` | Completes the outstanding direct read if address/status match expectations. |
+| `CSR_NOTIFY` | Kintex to PF | `{addr, value32}` | Reports remote-side value change; PF updates shadow through the notification FIFO. |
+| `CSR_ERROR` | Either | `{status, optional_addr}` | Reports link/protocol/apply error where available. |
 
-Each descriptor covers either one register or a naturally aligned register
-range/group. Ownership remains per register. If a range descriptor is used, all
-registers in that range must share the same ownership and semantic class, or the
-implementation must provide a deterministic sub-entry override.
+`CSR_READ_RESP` may use a transaction id instead of `addr` if commLVDS provides
+one, but v1 requires only one outstanding direct read, so address matching is
+sufficient for the Remote CSR Proxy contract.
 
-**Assumption, not final decision:** descriptors are loaded by MSS during boot or
-recovery and are not modified while the affected group is active.
+---
 
-### 3.2 Proposed Descriptor Fields
+## 5. Descriptor Table v1
 
-| Field | Required | Meaning |
+The v1 Descriptor Table is intentionally reduced to two bitmaps. Register
+address is implied by the descriptor index.
+
+### 5.1 Bitmap Fields
+
+| Field | Width | Meaning |
 | --- | --- | --- |
-| `valid` | Yes | Entry participates in descriptor lookup. Invalid entries cause an unmapped/access error. |
-| `base_addr` | Yes | Base address in the Shadow CSR aperture or remote CSR address domain, depending on address-map convention. |
-| `addr_mask` / `limit` | Yes for ranges | Defines the register or range covered by the descriptor. Single-register entries may use zero mask/length. |
-| `width` | Yes | Register width in bits or bytes. Used for byte-enable validation and packet sizing. |
-| `owner` | Yes | `MSS` or `KINTEX`. Defines the authoritative side for the register value. |
-| `access` | Yes | `RO`, `WO`, or `RW` MSS-visible access class. |
-| `semantic` | Yes | Register semantic class: `normal`, `status_ro`, `doorbell_wo`, `reserved`, or `unsupported`. |
-| `shadow_policy` | Yes | How the Shadow CSR Bank is updated and exposed: `commit_local`, `commit_on_remote`, `event_only`, `last_write_debug`, or `invalid_read`. |
-| `write_commit_policy` | Yes | MSS write completion mode candidate: `local_accept`, `remote_accept`, `remote_commit`, or `reject`. See OQ-001. |
-| `event_policy` | Yes | Whether Kintex update events are expected, optional, interrupting, coalesced, or ignored for this entry. |
-| `resync_group` | Yes | Group id used by boot/recovery/idle resync flows. |
-| `error_policy` | Yes | Access violation, timeout, stale-read, and remote-error reporting behavior. |
-| `order_domain` | Recommended | Ordering domain for writes/events that must be observed in sequence relative to each other. |
-| `reset_value` | Optional | Initial shadow value before first valid resync/event, if a deterministic reset image is valid. |
-| `wstrb_mask` | Optional | Byte lanes or bits that may be modified by MSS writes. Does not create split ownership. |
-| `event_threshold` | Optional | Coalescing or interrupt threshold for high-rate update sources. |
-| `capability_flags` | Optional | Implementation-specific support flags, such as strict ack support or per-register stale status. |
+| `read_source_bitmap[255:0]` | 256 bits | `0 = LOCAL_SHADOW`, `1 = DIRECT_REMOTE`. |
+| `notify_on_change_bitmap[255:0]` | 256 bits | `1 = raise notification status/interrupt when CSR_NOTIFY updates this index.` |
 
-### 3.3 Descriptor Constraints
+For register index `i`:
 
-| Constraint | Rationale |
+```text
+csr_addr = csr_base + (i * 4)
+```
+
+### 5.2 Deferred Rich Descriptor Fields
+
+The following fields from earlier drafts are deferred from v1:
+
+| Deferred field | v1 replacement |
 | --- | --- |
-| `owner` is single-valued for each register. | Preserves D-005 and avoids merge ownership. |
-| `doorbell_wo` must use `access = WO`. | Preserves D-007 and avoids meaningful readback expectations. |
-| Clear-on-read and FIFO-pop side effects should be `unsupported` unless explicitly modeled later. | Avoids pretending shadow reads can preserve remote side effects. |
-| `event_only` shadow policy is natural for Kintex-owned RO/status registers. | Kintex remains authoritative. |
-| Descriptor changes for an active group require quiesce/disable/resync. | Prevents policy changes racing in-flight writes/events. |
+| `owner` | Software discipline plus shadow write propagation. |
+| `access` / RO / WO / RW | All Shadow CSR Bank registers are AXI-visible 32-bit RW. |
+| `semantic` | Software chooses `DIRECT_REMOTE` for side-effect-sensitive reads. |
+| `shadow_policy` | Writes always update shadow; reads use `read_source_bitmap`. |
+| `write_commit_policy` | Writes complete after local shadow update and commLVDS queue acceptance. |
+| `event_policy` | Replaced by `notify_on_change_bitmap`. |
+| `resync_group` | Deferred; v1 recovery may treat the 256-register aperture as one group unless later refined. |
+| per-register error policy | Deferred; v1 uses global/sticky status with optional last address. |
 
----
+### 5.3 Side-Effect Register Policy
 
-## 4. Register Semantic Taxonomy
+Hardware does not enforce a special side-effect register class in v1. Side-effect
+correctness is an MSS/software responsibility:
 
-### 4.1 Ownership Classes
-
-| Class | Authoritative value source | Normal update path |
-| --- | --- | --- |
-| MSS-owned | MSS write accepted by PF policy | MSS write updates shadow, then PF propagates to Kintex. |
-| Kintex-owned | Kintex endpoint/IP | Kintex event or resync updates shadow. MSS writes, if allowed, are requests and not authoritative commits. |
-
-### 4.2 MSS-Visible Access Classes
-
-| Access | MSS read | MSS write |
-| --- | --- | --- |
-| `RO` | Returns shadow/proxy value subject to validity policy. | Rejected or ignored according to `error_policy`. |
-| `WO` | No meaningful architectural readback. | Accepted only if semantic policy allows. |
-| `RW` | Returns shadow/proxy value. | Processed according to ownership and commit policy. |
-
-### 4.3 Semantic Classes
-
-| Semantic | Intended use | Shadow meaning |
-| --- | --- | --- |
-| `normal` | Configuration/control register without read side effects. | Current proxy value, subject to stale status. |
-| `status_ro` | Kintex-produced status or measurement register. | Last valid event/resync value. |
-| `doorbell_wo` | Command/pulse trigger. | Not architectural state; optional last-write debug only. |
-| `reserved` | Address hole reserved for future use. | No valid CSR state. |
-| `unsupported` | Register semantics not safely virtualized. | Access should be rejected or reported. |
-
----
-
-## 5. MSS Read Semantics
-
-All normal MSS reads from the Shadow CSR aperture are satisfied locally by the
-Remote CSR Proxy.
-
-| Register class | Read behavior |
+| Register behavior | v1 expected software choice |
 | --- | --- |
-| MSS-owned `RW` | Return the current shadow value. If remote propagation is pending or failed, expose that through status. |
-| Kintex-owned `RW` | Return the last committed Kintex-authoritative value, unless a descriptor-selected pending overlay is explicitly exposed. |
-| Kintex-owned `RO` / `status_ro` | Return the last event/resync value if valid. If stale/invalid, behavior is selected by `error_policy`. |
-| `WO` / `doorbell_wo` | Readback is not meaningful. Recommended default is a deterministic value plus status/error reporting, but exact `RRESP` policy is open. |
-| `reserved` / `unsupported` | Return an access error or deterministic reserved value according to `error_policy`. |
+| Normal control/status read | `LOCAL_SHADOW` unless freshness requires direct read. |
+| Clear-on-read | `DIRECT_REMOTE` if the side effect must occur. |
+| FIFO-pop/read-trigger | `DIRECT_REMOTE` if the side effect must occur. |
+| Polling stale-sensitive status | `DIRECT_REMOTE` or local read plus explicit stale/error checks. |
+| Doorbell/pulse write | Normal shadow write, producing `CSR_WRITE`; readback is software-defined. |
 
-The proxy must not hide invalid or stale state silently. At minimum, affected
-groups must expose `VALID`, `STALE`, `REMOTE_ERR`, or `RESYNC_REQUIRED` style
-state through the proxy status window.
-
-**Open policy:** whether stale reads are always allowed, blocked, or faulted for
-selected descriptors remains open under OQ-002.
+Selecting `LOCAL_SHADOW` for a side-effect register is allowed by v1 hardware but
+may be functionally unsafe.
 
 ---
 
-## 6. MSS Write Semantics
+## 6. MSS Read Semantics
 
-### 6.1 MSS-Owned Registers
+For a Shadow CSR aperture read, PF Fabric computes register index `i` from the
+AXI address.
 
-For an MSS-owned `RW` register:
+### 6.1 Local Shadow Read
 
-1. PF Fabric performs descriptor lookup and access validation.
-2. Shadow CSR Bank is updated with the MSS write value, masked by legal byte
-   enables if supported.
-3. The CSR Synchronization Engine queues a PF-to-Kintex write/update message.
-4. MSS write completion follows `write_commit_policy`.
-5. Remote acknowledgment/failure updates pending/error status.
+If `read_source_bitmap[i] = 0`:
 
-Recommended conservative interpretation:
+1. PF reads `shadow_ram[i]`.
+2. PF returns the value on AXI `RDATA`.
+3. No commLVDS read message is generated.
 
-| Completion mode | Meaning |
-| --- | --- |
-| `local_accept` | AXI write completes after local shadow update and queue acceptance. Remote failure is reported asynchronously. |
-| `remote_accept` | AXI write completes after Kintex endpoint accepts the request. |
-| `remote_commit` | AXI write completes after Kintex reports the remote CSR effect committed. |
+This is the baseline fast path and remains the default for resource-efficient
+near-local MMIO behavior.
 
-`local_accept` preserves the strongest local-MMIO feel but increases the need for
-visible pending/error status.
+### 6.2 Direct Remote Read
 
-### 6.2 Kintex-Owned Registers
+If `read_source_bitmap[i] = 1`:
 
-For a Kintex-owned `RW` register:
+1. PF waits until the single direct-read engine is idle.
+2. PF issues `CSR_READ_REQ(addr)` over commLVDS.
+3. PF holds the AXI read response until one of these occurs:
+   - matching `CSR_READ_RESP` with success,
+   - matching `CSR_READ_RESP` with error status,
+   - timeout,
+   - commLVDS link/protocol error.
+4. On success, PF returns `value32` on AXI `RDATA`.
+5. On error or timeout, PF returns an AXI error response and sets sticky status.
 
-1. PF Fabric performs descriptor lookup and access validation.
-2. MSS write is treated as a request to the Kintex owner, not as an
-   authoritative local commit.
-3. PF queues a write/request message to Kintex if the descriptor permits it.
-4. Shadow commit should occur only after Kintex accepts/commits the value or
-   sends a normal address/value update event.
-5. Pending state should be visible to MSS if the write response can complete
-   before authoritative shadow commit.
+Only one direct remote read may be outstanding. A second direct read is stalled
+at the AXI interface until the direct-read engine becomes idle.
 
-This preserves per-register ownership and avoids silently overwriting a
-Kintex-owned value with a local speculative value.
-
-**Open policy:** whether a temporary pending overlay may be read back before
-Kintex confirmation remains open under OQ-001 and OQ-008.
-
-### 6.3 RO Registers
-
-For `RO` registers, MSS writes are access violations unless an explicit
-descriptor policy defines them as ignored compatibility writes.
-
-**Open policy:** integration/debug builds may prefer error responses, while
-driver-compatibility builds may prefer OKAY-ignore behavior. The exact default
-is not frozen.
-
-### 6.4 WO / Doorbell Registers
-
-For `WO` / `doorbell_wo` registers:
-
-1. PF Fabric validates the descriptor and write value/byte enables.
-2. PF queues a doorbell request to Kintex.
-3. Shadow state is not architectural. PF may record last write value for debug.
-4. Doorbell completion follows `write_commit_policy`.
-5. Doorbell replay after retry or recovery must be explicitly controlled to
-   avoid duplicate remote command effects.
-
-Doorbell registers do not require auto-clear semantics unless a future
-decision-log entry adds that behavior.
-
-### 6.5 RW Registers
-
-For `RW` registers, the owner determines commit authority:
-
-| Owner | Write authority | Shadow commit rule |
-| --- | --- | --- |
-| MSS | MSS write is authoritative after PF accepts it under descriptor policy. | Usually commit local, then propagate. |
-| Kintex | MSS write is a request to owner. | Commit on Kintex accept/update, or expose pending separately if selected. |
+**Proposed refinement to D-003:** direct remote read is a selected exception to
+the normal shadow-read policy. This remains open until recorded in
+`decision_log.md`.
 
 ---
 
-## 7. Kintex-Originated Update Semantics
+## 7. MSS Write Semantics
 
-Kintex-originated register update events must carry at least address and new
-value.
+All v1 Shadow CSR aperture writes use the shadow/proxy path. There is no direct
+remote write mode.
+
+For an AXI write to register index `i`:
+
+1. PF accepts the write only when the local shadow write path and commLVDS write
+   queue have space.
+2. PF updates `shadow_ram[i]` with the 32-bit AXI write value.
+3. PF queues `CSR_WRITE(addr, value32)` to Kintex.
+4. PF returns AXI `BRESP` after local shadow update plus queue acceptance.
+5. PF does not wait for Kintex to apply the write.
+
+If the write queue is full, PF stalls write acceptance. No shadow update occurs
+before queue acceptance.
+
+If Kintex later reports a write/apply failure through `CSR_ERROR`, PF records it
+as asynchronous sticky status and may interrupt MSS. AXI write completion must
+not be interpreted as proof that Kintex has already applied the write.
+
+---
+
+## 8. Kintex Notification Semantics
+
+Kintex sends `CSR_NOTIFY(addr, value32)` when a remote-side CSR value changes.
 
 On receipt:
 
-1. PF validates framing, descriptor match, width, and allowed event policy.
-2. PF applies the new value to the Shadow CSR Bank before notifying MSS.
-3. PF updates validity/stale/error metadata for the affected descriptor or
-   resync group.
-4. PF records event information in the event/status window.
-5. PF asserts interrupt if enabled by `event_policy`.
+1. PF validates that `addr` maps into the 256-register aperture.
+2. PF pushes the notification into the 8-entry notification FIFO.
+3. PF drains the FIFO into `shadow_ram[index]`.
+4. If `notify_on_change_bitmap[index] = 1`, PF records notification status and
+   raises an interrupt if enabled.
+5. PF updates optional last-notification address/value status.
 
-If an event targets an MSS-owned register, PF must treat it as either an error,
-diagnostic mirror update, or explicit owner-conflict policy. The current
-decision log does not authorize split ownership or silent Kintex override of
-MSS-owned registers.
+If the FIFO overflows, PF sets sticky overflow/error status and marks shadow
+state suspect. Software is expected to recover with boot/recovery/idle resync.
 
-**Open policy:** sequence number width, deduplication behavior, event batching,
-and lost-event detection remain open under OQ-005 and OQ-008.
+Notification FIFO ordering is preserved for accepted entries. If entries are
+lost due to overflow, the affected shadow state is not reliable until recovery.
 
 ---
 
-## 8. Resync Semantics
+## 9. Resync Semantics
 
-Full or block resync is allowed only during boot, recovery, or explicitly idle
-conditions.
+Full or block resync remains allowed only during boot, recovery, or explicitly
+idle conditions.
+
+For v1, the default resource-optimized interpretation is that the 256-register
+aperture is one recovery group unless a later design iteration adds resync group
+metadata.
 
 Required lifecycle:
 
-1. MSS or recovery logic requests resync for one or more `resync_group` ids.
-2. PF quiesces affected groups and blocks or drains conflicting writes/events.
-3. PF marks affected shadow entries invalid/stale or resync-in-progress.
-4. Kintex sends a snapshot stream of address/value pairs for the group.
-5. PF validates each update against descriptors and applies it to shadow.
-6. PF marks the group valid when the snapshot end marker is accepted.
-7. PF reports completion or failure to MSS.
+1. MSS or recovery logic enters idle/quiesced state.
+2. PF blocks new conflicting AXI accesses for the affected aperture if needed.
+3. PF requests or receives a snapshot of address/value pairs from Kintex.
+4. PF validates each address and updates `shadow_ram[index]`.
+5. PF marks the aperture valid when the snapshot completes.
+6. PF reports completion or failure to MSS.
 
-Resync must not be used as a normal live coherency mechanism during active
-operation.
-
-**Open policy:** global vs per-group resync, interrupt masking during resync, and
-software/firmware ownership of recovery initiation remain open under OQ-006.
+Resync is not a normal live coherency mechanism.
 
 ---
 
-## 9. Ordering and Coherency
+## 10. Ordering and Coherency
 
-The proxy should expose ordering guarantees explicitly rather than implying a
-perfect MMIO illusion.
-
-Candidate ordering rules:
-
-| Rule | Status |
+| Rule | v1 contract |
 | --- | --- |
-| Shadow update is visible before the corresponding MSS interrupt is asserted. | Strong recommendation for contract. |
-| PF preserves ordering of MSS writes within the same `order_domain`. | Proposed descriptor-driven rule. |
-| Kintex update sequence gaps mark affected group stale/resync-required. | Proposed event protocol rule. |
-| No global ordering is promised across unrelated descriptor groups unless they share an `order_domain`. | Conservative assumption. |
-| AXI write completion does not necessarily mean remote side effect committed unless `write_commit_policy` says so. | Required distinction. |
+| Local reads | Return current PF shadow RAM value. |
+| Direct reads | Return the remote response value or AXI error; only one in flight. |
+| Writes | Shadow update and `CSR_WRITE` queue acceptance happen before AXI `BRESP`. |
+| Remote write apply | Not ordered with AXI `BRESP`; failures are asynchronous. |
+| Notifications | Accepted FIFO entries update shadow in FIFO order. |
+| Interrupt timing | Notification-driven interrupt/status is raised after the shadow update is applied. |
+| Descriptor bitmap updates | Boot/recovery/idle only; not active-traffic updates. |
 
-**Open policy:** exact memory-barrier guidance for MSS software remains open
-under OQ-007 and OQ-008.
+Software must use direct reads or explicit status checks when freshness matters.
+Polling a local shadow value alone does not prove commLVDS link health or remote
+hardware progress.
 
 ---
 
-## 10. Status and Error Model
+## 11. Status and Error Model
 
-At minimum, PF Fabric should expose group-level status containing:
+At minimum, PF Fabric exposes global/status-window indicators for:
 
 | Status | Meaning |
 | --- | --- |
-| `VALID` | Shadow value/group has been initialized by reset value, event, or resync. |
-| `STALE` | Shadow may no longer match Kintex due to link, ordering, or lost-event condition. |
-| `REMOTE_ERR` | Kintex reported failure applying or producing a requested operation. |
-| `PENDING` | One or more writes/events are in flight for the group. |
-| `RESYNC_REQUIRED` | Software should run recovery/idle resync before relying on the group. |
-| `ACCESS_ERR` | MSS attempted an access disallowed by descriptor policy. |
-| `DESC_ERR` | Descriptor lookup/configuration conflict was detected. |
-| `EVENT_OVERRUN` | Event queue or sequence tracking lost information. |
+| `LINK_UP` | commLVDS link/protocol layer is usable. |
+| `DIRECT_READ_BUSY` | Single direct-read engine has an outstanding read. |
+| `DIRECT_READ_TIMEOUT` | A direct remote read timed out. |
+| `DIRECT_READ_ERR` | Direct read completed with remote/protocol error. |
+| `WRITE_QUEUE_FULL` | Write acceptance is stalled because the commLVDS write queue is full. |
+| `REMOTE_WRITE_ERR` | Kintex reported a write/apply error asynchronously. |
+| `NOTIFY_PENDING` | Notification FIFO contains entries or pending notification status exists. |
+| `NOTIFY_OVERFLOW` | Notification FIFO overflowed; shadow state may be suspect. |
+| `SHADOW_SUSPECT` | Software should recover/resync before relying on local shadow. |
+| `LAST_ERR_ADDR` | Optional last address associated with timeout/error/overflow. |
 
-Per-register status is allowed as an implementation enhancement. Group-level
-status is the minimum practical requirement implied by D-003 and D-009.
+Per-register status is not required in v1.
 
 ---
 
-## 11. State Diagrams
+## 12. State Diagrams
 
-### 11.1 MSS-Owned Write
+### 12.1 Local Shadow Read
 
 ```mermaid
 stateDiagram-v2
     [*] --> Decode
-    Decode --> Reject: descriptor/access error
-    Decode --> CommitShadow: MSS-owned RW
-    CommitShadow --> QueueRemote
-    QueueRemote --> AxiComplete: local_accept
-    QueueRemote --> WaitRemoteAccept: remote_accept/remote_commit
-    WaitRemoteAccept --> AxiComplete: ack ok
-    WaitRemoteAccept --> Error: ack fail/timeout
-    AxiComplete --> PendingRemote: remote still in flight
-    PendingRemote --> Done: remote ack ok
-    PendingRemote --> Error: remote fail/timeout
-    Reject --> [*]
-    Done --> [*]
-    Error --> [*]
+    Decode --> ReadShadow: read_source = LOCAL_SHADOW
+    ReadShadow --> AxiReadData
+    AxiReadData --> [*]
 ```
 
-### 11.2 Kintex-Owned Update
-
-```mermaid
-stateDiagram-v2
-    [*] --> ReceiveEvent
-    ReceiveEvent --> Validate
-    Validate --> Error: bad descriptor/sequence/payload
-    Validate --> ApplyShadow: address + new value accepted
-    ApplyShadow --> UpdateStatus
-    UpdateStatus --> NotifyMSS: interrupt enabled
-    UpdateStatus --> Done: interrupt disabled
-    NotifyMSS --> Done
-    Error --> MarkStale
-    MarkStale --> NotifyMSS
-    Done --> [*]
-```
-
-### 11.3 Doorbell WO Write
+### 12.2 Direct Remote Read
 
 ```mermaid
 stateDiagram-v2
     [*] --> Decode
-    Decode --> Reject: not WO/doorbell or invalid byte enables
-    Decode --> RecordOptionalDebug
-    RecordOptionalDebug --> QueueDoorbell
-    QueueDoorbell --> AxiComplete: local_accept
-    QueueDoorbell --> WaitRemote: strict policy
-    WaitRemote --> AxiComplete: ack ok
-    WaitRemote --> Error: ack fail/timeout
-    AxiComplete --> Done
-    Reject --> [*]
-    Error --> [*]
-    Done --> [*]
+    Decode --> WaitEngineIdle: read_source = DIRECT_REMOTE
+    WaitEngineIdle --> SendReadReq: engine idle
+    SendReadReq --> WaitResponse
+    WaitResponse --> AxiReadData: CSR_READ_RESP ok
+    WaitResponse --> AxiReadError: CSR_READ_RESP error
+    WaitResponse --> AxiReadError: timeout/link error
+    AxiReadData --> ReleaseEngine
+    AxiReadError --> SetStickyStatus
+    SetStickyStatus --> ReleaseEngine
+    ReleaseEngine --> [*]
 ```
 
-### 11.4 Resync Lifecycle
+### 12.3 Shadow Write
 
 ```mermaid
 stateDiagram-v2
-    [*] --> IdleOrRecovery
-    IdleOrRecovery --> QuiesceGroup
-    QuiesceGroup --> MarkInvalidOrStale
-    MarkInvalidOrStale --> RequestSnapshot
-    RequestSnapshot --> ApplySnapshot
-    ApplySnapshot --> Complete: end marker and validation ok
-    ApplySnapshot --> Error: timeout/bad descriptor/lost data
-    Complete --> MarkValid
-    MarkValid --> Resume
-    Error --> ResyncRequired
-    Resume --> [*]
-    ResyncRequired --> [*]
+    [*] --> Decode
+    Decode --> WaitQueueSpace
+    WaitQueueSpace --> UpdateShadow: queue space available
+    UpdateShadow --> QueueCsrWrite
+    QueueCsrWrite --> AxiWriteResp
+    AxiWriteResp --> [*]
+```
+
+### 12.4 Notification Update
+
+```mermaid
+stateDiagram-v2
+    [*] --> ReceiveNotify
+    ReceiveNotify --> PushFifo: fifo space
+    ReceiveNotify --> Overflow: fifo full
+    PushFifo --> DrainToShadow
+    DrainToShadow --> CheckNotifyBit
+    CheckNotifyBit --> RaiseStatusIrq: notify_on_change = 1
+    CheckNotifyBit --> Done: notify_on_change = 0
+    RaiseStatusIrq --> Done
+    Overflow --> SetShadowSuspect
+    SetShadowSuspect --> Done
+    Done --> [*]
 ```
 
 ---
 
-## 12. Driver Compatibility Boundaries
+## 13. Driver Compatibility Boundaries
 
-The intended software model is "near-local MMIO" rather than transparent remote
-hardware identity.
+The intended software model is "near-local MMIO with selectable direct reads,"
+not transparent remote hardware identity.
 
-Driver assumptions that are compatible:
-
-| Assumption | Compatibility |
+| Driver assumption | v1 compatibility |
 | --- | --- |
-| Normal control/status registers read through `readl` and write through `writel`. | Usually compatible if staleness and completion policy are handled. |
-| Polling a status bit after a command. | Compatible only if status updates are delivered with bounded/eventual latency and stale status is checked. |
-| Write-one command pulse. | Compatible when modeled as `doorbell_wo`. |
-
-Driver assumptions that are risky or unsupported:
-
-| Assumption | Risk |
-| --- | --- |
-| Read has a side effect, such as clear-on-read or FIFO pop. | Shadow read cannot preserve remote side effect. |
-| Write completion means remote hardware has acted. | False unless strict `write_commit_policy` is selected. |
-| Polling alone proves link health. | Shadow may remain readable while remote link is failed. |
-| Bit-field ownership is split between MSS and Kintex. | Conflicts with per-register ownership decision. |
+| Normal `readl` of stable control/status | Compatible through `LOCAL_SHADOW`. |
+| Stale-sensitive polling | Use `DIRECT_REMOTE` or check stale/error/link status. |
+| Read-side-effect register | Use `DIRECT_REMOTE`; local shadow reads do not trigger remote side effects. |
+| Normal `writel` control update | Compatible; write updates shadow and queues `CSR_WRITE`. |
+| Write completion means remote apply | Not compatible; remote apply failure is asynchronous. |
+| Direct remote write | Not supported in v1. |
 
 ---
 
-## 13. Items Still Not Frozen
+## 14. Items Still Not Frozen
 
 The following remain open design topics and should be refined in
 `open_questions.md` or promoted into `decision_log.md` before RTL freeze:
 
 | Topic | Tracking |
 | --- | --- |
-| AXI `BRESP`/`RRESP` policy and strict vs optimistic completion | OQ-001 |
-| Stale/invalid read visibility and granularity | OQ-002 |
-| Final descriptor field encodings and programming model | OQ-003 |
-| Unsupported side-effect register handling | OQ-004 |
-| Event sequencing, batching, retry, and deduplication | OQ-005 |
-| Recovery initiator and resync scope | OQ-006 |
-| Driver compatibility and portability wrapper guidance | OQ-007 |
-| Ordering domains and barrier requirements | OQ-008 |
-| Wire-level PF/Kintex protocol | OQ-009 |
-| Final lifecycle/state-machine acceptance criteria | OQ-010 |
+| Whether selectable direct reads should revise D-003 | OQ-012 |
+| Minimal bitmap descriptor schema and programming model | OQ-003, OQ-012 |
+| Direct-read timeout value and AXI error response encoding | OQ-012 |
+| commLVDS wire framing, retry, and link-level error behavior | OQ-009 |
+| Notification FIFO overflow recovery details | OQ-005, OQ-006, OQ-012 |
+| Whether later revisions need rich descriptors or per-register status | OQ-003, OQ-011 |
